@@ -3,6 +3,7 @@ import torch
 
 from .module import Module
 from ..parameter import Parameter
+from ..utils.rnn import PackedSequence
 
 
 class RNNBase(Module):
@@ -22,7 +23,7 @@ class RNNBase(Module):
         self.bidirectional = bidirectional
         num_directions = 2 if bidirectional else 1
 
-        self.all_weights = []
+        self._all_weights = []
         for layer in range(num_layers):
             for direction in range(num_directions):
                 layer_input_size = input_size if layer == 0 else hidden_size * num_directions
@@ -39,14 +40,16 @@ class RNNBase(Module):
                 b_hh = Parameter(torch.Tensor(gate_size))
 
                 suffix = '_reverse' if direction == 1 else ''
-                setattr(self, 'weight_ih_l{}{}'.format(layer, suffix), w_ih)
-                setattr(self, 'weight_hh_l{}{}'.format(layer, suffix), w_hh)
+                weights = ['weight_ih_l{}{}', 'weight_hh_l{}{}', 'bias_ih_l{}{}', 'bias_hh_l{}{}']
+                weights = [x.format(layer, suffix) for x in weights]
+                setattr(self, weights[0], w_ih)
+                setattr(self, weights[1], w_hh)
                 if bias:
-                    setattr(self, 'bias_ih_l{}{}'.format(layer, suffix), b_ih)
-                    setattr(self, 'bias_hh_l{}{}'.format(layer, suffix), b_hh)
-                    self.all_weights += [(w_ih, w_hh, b_ih, b_hh)]
+                    setattr(self, weights[2], b_ih)
+                    setattr(self, weights[3], b_hh)
+                    self._all_weights += [weights]
                 else:
-                    self.all_weights += [(w_ih, w_hh)]
+                    self._all_weights += [weights[:2]]
 
         self.reset_parameters()
 
@@ -56,15 +59,23 @@ class RNNBase(Module):
             weight.data.uniform_(-stdv, stdv)
 
     def forward(self, input, hx=None):
+        is_packed = isinstance(input, PackedSequence)
+        if is_packed:
+            input, batch_sizes = input
+            max_batch_size = batch_sizes[0]
+        else:
+            batch_sizes = None
+            max_batch_size = input.size(0) if self.batch_first else input.size(1)
+
         if hx is None:
-            batch_sz = input.size(0) if self.batch_first else input.size(1)
             num_directions = 2 if self.bidirectional else 1
             hx = torch.autograd.Variable(input.data.new(self.num_layers *
                                                         num_directions,
-                                                        batch_sz,
+                                                        max_batch_size,
                                                         self.hidden_size).zero_())
             if self.mode == 'LSTM':
                 hx = (hx, hx)
+
         func = self._backend.RNN(
             self.mode,
             self.input_size,
@@ -74,9 +85,13 @@ class RNNBase(Module):
             dropout=self.dropout,
             train=self.training,
             bidirectional=self.bidirectional,
+            batch_sizes=batch_sizes,
             dropout_state=self.dropout_state
         )
-        return func(input, self.all_weights, hx)
+        output, hidden = func(input, self.all_weights, hx)
+        if is_packed:
+            output = PackedSequence(output, batch_sizes)
+        return output, hidden
 
     def __repr__(self):
         s = '{name}({input_size}, {hidden_size}'
@@ -92,6 +107,29 @@ class RNNBase(Module):
             s += ', bidirectional={bidirectional}'
         s += ')'
         return s.format(name=self.__class__.__name__, **self.__dict__)
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        if 'all_weights' in d:
+            self._all_weights = d['all_weights']
+        if isinstance(self._all_weights[0][0], str):
+            return
+        num_layers = self.num_layers
+        num_directions = 2 if self.bidirectional else 1
+        self._all_weights = []
+        for layer in range(num_layers):
+            for direction in range(num_directions):
+                suffix = '_reverse' if direction == 1 else ''
+                weights = ['weight_ih_l{}{}', 'weight_hh_l{}{}', 'bias_ih_l{}{}', 'bias_hh_l{}{}']
+                weights = [x.format(layer, suffix) for x in weights]
+                if self.bias:
+                    self._all_weights += [weights]
+                else:
+                    self._all_weights += [weights[:2]]
+
+    @property
+    def all_weights(self):
+        return [[getattr(self, weight) for weight in weights] for weights in self._all_weights]
 
 
 class RNN(RNNBase):
@@ -115,18 +153,21 @@ class RNN(RNNBase):
         num_layers: Number of recurrent layers.
         nonlinearity: The non-linearity to use ['tanh'|'relu']. Default: 'tanh'
         bias: If False, then the layer does not use bias weights b_ih and b_hh. Default: True
-        batch_first: If True, then the input tensor is provided as (batch, seq, feature)
-        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer
+        batch_first: If True, then the input and output tensors are provided as (batch, seq, feature)
+        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer except the last layer
         bidirectional: If True, becomes a bidirectional RNN. Default: False
 
     Inputs: input, h_0
         - **input** (seq_len, batch, input_size): tensor containing the features of the input sequence.
+          The input can also be a packed variable length sequence. See :func:`torch.nn.utils.rnn.pack_padded_sequence`
+          for details.
         - **h_0** (num_layers * num_directions, batch, hidden_size): tensor containing the initial hidden state
           for each element in the batch.
 
     Outputs: output, h_n
         - **output** (seq_len, batch, hidden_size * num_directions): tensor containing the output features (h_k)
-          from the last layer of the RNN, for each k.
+          from the last layer of the RNN, for each k.  If a :class:`torch.nn.utils.rnn.PackedSequence` has been given
+          as the input, the output will also be a packed sequence.
         - **h_n** (num_layers * num_directions, batch, hidden_size): tensor containing the hidden state for k=seq_len.
 
     Attributes:
@@ -189,12 +230,14 @@ class LSTM(RNNBase):
         hidden_size: The number of features in the hidden state h
         num_layers: Number of recurrent layers.
         bias: If False, then the layer does not use bias weights b_ih and b_hh. Default: True
-        batch_first: If True, then the input tensor is provided as (batch, seq, feature)
-        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer
+        batch_first: If True, then the input and output tensors are provided as (batch, seq, feature)
+        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer except the last layer
         bidirectional: If True, becomes a bidirectional RNN. Default: False
 
     Inputs: input, (h_0, c_0)
         - **input** (seq_len, batch, input_size): tensor containing the features of the input sequence.
+          The input can also be a packed variable length sequence. See :func:`torch.nn.utils.rnn.pack_padded_sequence`
+          for details.
         - **h_0** (num_layers \* num_directions, batch, hidden_size): tensor containing
           the initial hidden state for each element in the batch.
         - **c_0** (num_layers \* num_directions, batch, hidden_size): tensor containing
@@ -203,17 +246,21 @@ class LSTM(RNNBase):
 
     Outputs: output, (h_n, c_n)
         - **output** (seq_len, batch, hidden_size * num_directions): tensor containing
-          the output features `(h_t)` from the last layer of the RNN, for each t.
+          the output features `(h_t)` from the last layer of the RNN, for each t. If a
+          :class:`torch.nn.utils.rnn.PackedSequence` has been given as the input, the output will also be a
+          packed sequence.
         - **h_n** (num_layers * num_directions, batch, hidden_size): tensor containing the hidden state for t=seq_len
         - **c_n** (num_layers * num_directions, batch, hidden_size): tensor containing the cell state for t=seq_len
 
     Attributes:
-        weight_ih_l[k] : the learnable input-hidden weights of the k-th layer `(W_ir|W_ii|W_in)`, of shape
-                         `(input_size x 3*hidden_size)`
-        weight_hh_l[k] : the learnable hidden-hidden weights of the k-th layer `(W_hr|W_hi|W_hn)`, of shape
-                         `(hidden_size x 3*hidden_size)`
-        bias_ih_l[k] : the learnable input-hidden bias of the k-th layer `(b_ir|b_ii|b_in)`, of shape `(3*hidden_size)`
-        bias_hh_l[k] : the learnable hidden-hidden bias of the k-th layer `(W_hr|W_hi|W_hn)`, of shape `(3*hidden_size)`
+        weight_ih_l[k] : the learnable input-hidden weights of the k-th layer `(W_ii|W_if|W_ig|W_io)`, of shape
+                         `(input_size x 4*hidden_size)`
+        weight_hh_l[k] : the learnable hidden-hidden weights of the k-th layer `(W_hi|W_hf|W_hg|W_ho)`, of shape
+                         `(hidden_size x 4*hidden_size)`
+        bias_ih_l[k] : the learnable input-hidden bias of the k-th layer `(b_ii|b_if|b_ig|b_io)`, of shape
+                         `(4*hidden_size)`
+        bias_hh_l[k] : the learnable hidden-hidden bias of the k-th layer `(W_hi|W_hf|W_hg|b_ho)`, of shape
+                         `(4*hidden_size)`
 
     Examples::
 
@@ -253,27 +300,32 @@ class GRU(RNNBase):
         hidden_size: The number of features in the hidden state h
         num_layers: Number of recurrent layers.
         bias: If False, then the layer does not use bias weights b_ih and b_hh. Default: True
-        batch_first: If True, then the input tensor is provided as (batch, seq, feature)
-        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer
+        batch_first: If True, then the input and output tensors are provided as (batch, seq, feature)
+        dropout: If non-zero, introduces a dropout layer on the outputs of each RNN layer except the last layer
         bidirectional: If True, becomes a bidirectional RNN. Default: False
 
     Inputs: input, h_0
         - **input** (seq_len, batch, input_size): tensor containing the features of the input sequence.
+          The input can also be a packed variable length sequence. See :func:`torch.nn.utils.rnn.pack_padded_sequence`
+          for details.
         - **h_0** (num_layers * num_directions, batch, hidden_size): tensor containing the initial
           hidden state for each element in the batch.
 
     Outputs: output, h_n
         - **output** (seq_len, batch, hidden_size * num_directions): tensor containing the output features h_t from
-          the last layer of the RNN, for each t.
+          the last layer of the RNN, for each t. If a :class:`torch.nn.utils.rnn.PackedSequence` has been given as the
+          input, the output will also be a packed sequence.
         - **h_n** (num_layers * num_directions, batch, hidden_size): tensor containing the hidden state for t=seq_len
 
     Attributes:
         weight_ih_l[k] : the learnable input-hidden weights of the k-th layer (W_ir|W_ii|W_in), of shape
-                         (input_size x 3*hidden_size)
+                         `(input_size x 3*hidden_size)`
         weight_hh_l[k] : the learnable hidden-hidden weights of the k-th layer (W_hr|W_hi|W_hn), of shape
-                         (hidden_size x 3*hidden_size)
-        bias_ih_l[k] : the learnable input-hidden bias of the k-th layer (b_ir|b_ii|b_in), of shape (3*hidden_size)
-        bias_hh_l[k] : the learnable hidden-hidden bias of the k-th layer (W_hr|W_hi|W_hn), of shape (3*hidden_size)
+                         `(hidden_size x 3*hidden_size)`
+        bias_ih_l[k] : the learnable input-hidden bias of the k-th layer (b_ir|b_ii|b_in), of shape
+                         `(3*hidden_size)`
+        bias_hh_l[k] : the learnable hidden-hidden bias of the k-th layer (W_hr|W_hi|W_hn), of shape
+                         `(3*hidden_size)`
     Examples::
 
         >>> rnn = nn.GRU(10, 20, 2)
@@ -333,8 +385,8 @@ class RNNCell(RNNCellBase):
         >>> hx = Variable(torch.randn(3, 20))
         >>> output = []
         >>> for i in range(6):
-        ...     hx = rnn(input, hx)
-        ...     output[i] = hx
+        ...     hx = rnn(input[i], hx)
+        ...     output.append(hx)
     """
 
     def __init__(self, input_size, hidden_size, bias=True, nonlinearity="tanh"):
@@ -411,13 +463,13 @@ class LSTMCell(RNNCellBase):
     Examples::
 
         >>> rnn = nn.LSTMCell(10, 20)
-        >>> input = Variable(torch.randn(3, 10))
+        >>> input = Variable(torch.randn(6, 3, 10))
         >>> hx = Variable(torch.randn(3, 20))
         >>> cx = Variable(torch.randn(3, 20))
         >>> output = []
         >>> for i in range(6):
-        ...     hx, cx = rnn(input, (hx, cx))
-        ...     output[i] = hx
+        ...     hx, cx = rnn(input[i], (hx, cx))
+        ...     output.append(hx)
     """
 
     def __init__(self, input_size, hidden_size, bias=True):
@@ -480,13 +532,13 @@ class GRUCell(RNNCellBase):
 
     Examples::
 
-        >>> rnn = nn.RNNCell(10, 20)
+        >>> rnn = nn.GRUCell(10, 20)
         >>> input = Variable(torch.randn(6, 3, 10))
         >>> hx = Variable(torch.randn(3, 20))
         >>> output = []
         >>> for i in range(6):
-        ...     hx = rnn(input, hx)
-        ...     output[i] = hx
+        ...     hx = rnn(input[i], hx)
+        ...     output.append(hx)
     """
 
     def __init__(self, input_size, hidden_size, bias=True):

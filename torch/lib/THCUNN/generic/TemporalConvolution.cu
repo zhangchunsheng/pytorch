@@ -98,9 +98,10 @@ void THNN_(TemporalConvolution_updateOutput)(
                               nFrame, outputFrameStride*output->size[1],
                               output->size[1], 1);
 
-      THCTensor_(transpose)(state, weight, NULL, 0, 1);
-      THCTensor_(addmm)(state, outputWindow, ScalarConvert<int, real>::to(1), outputWindow, ScalarConvert<int, real>::to(1), inputWindow, weight);
-      THCTensor_(transpose)(state, weight, NULL, 0, 1);
+      THCTensor *tweight = THCTensor_(new)(state);
+      THCTensor_(transpose)(state, tweight, weight, 0, 1);
+      THCTensor_(addmm)(state, outputWindow, ScalarConvert<int, real>::to(1), outputWindow, ScalarConvert<int, real>::to(1), inputWindow, tweight);
+      THCTensor_(free)(state, tweight);
     }
   }
   else
@@ -145,9 +146,10 @@ void THNN_(TemporalConvolution_updateOutput)(
                                 nFrame, outputFrameStride*outputSample->size[1],
                                 outputSample->size[1], 1);
 
-        THCTensor_(transpose)(state, weight, NULL, 0, 1);
-        THCTensor_(addmm)(state, outputWindow, ScalarConvert<int, real>::to(1), outputWindow, ScalarConvert<int, real>::to(1), inputWindow, weight);
-        THCTensor_(transpose)(state, weight, NULL, 0, 1);
+        THCTensor *tweight = THCTensor_(new)(state);
+        THCTensor_(transpose)(state, tweight, weight, 0, 1);
+        THCTensor_(addmm)(state, outputWindow, ScalarConvert<int, real>::to(1), outputWindow, ScalarConvert<int, real>::to(1), inputWindow, tweight);
+        THCTensor_(free)(state, tweight);
       }
     }
     THCTensor_(free)(state, outputSample);
@@ -273,8 +275,9 @@ void THNN_(TemporalConvolution_accGradParameters)(
            THCTensor *gradWeight,
            THCTensor *gradBias,
            int kW, int dW,
-           real scale) {
+           accreal scale_) {
 
+  real scale = ScalarConvert<accreal, real>::to(scale_);
   long nInputFrame;
   long nOutputFrame;
 
@@ -328,9 +331,10 @@ void THNN_(TemporalConvolution_accGradParameters)(
                               nFrame, outputFrameStride*gradOutput->size[1],
                               gradOutput->size[1], 1);
 
-      THCTensor_(transpose)(state, gradOutputWindow, NULL, 0, 1);
-      THCTensor_(addmm)(state, gradWeight, ScalarConvert<int, real>::to(1), gradWeight, scale, gradOutputWindow, inputWindow);
-      THCTensor_(transpose)(state, gradOutputWindow, NULL, 0, 1);
+      THCTensor *tgradOutputWindow = THCTensor_(new)(state);
+      THCTensor_(transpose)(state, tgradOutputWindow, gradOutputWindow, 0, 1);
+      THCTensor_(addmm)(state, gradWeight, ScalarConvert<int, real>::to(1), gradWeight, scale, tgradOutputWindow, inputWindow);
+      THCTensor_(free)(state, tgradOutputWindow);
     }
   }
   else
@@ -370,9 +374,10 @@ void THNN_(TemporalConvolution_accGradParameters)(
                                 nFrame, outputFrameStride*gradOutputSample->size[1],
                                 gradOutputSample->size[1], 1);
 
-        THCTensor_(transpose)(state, gradOutputWindow, NULL, 0, 1);
-        THCTensor_(addmm)(state, gradWeight, ScalarConvert<int, real>::to(1), gradWeight, scale, gradOutputWindow, inputWindow);
-        THCTensor_(transpose)(state, gradOutputWindow, NULL, 0, 1);
+        THCTensor *tgradOutputWindow = THCTensor_(new)(state);
+        THCTensor_(transpose)(state, tgradOutputWindow, gradOutputWindow, 0, 1);
+        THCTensor_(addmm)(state, gradWeight, ScalarConvert<int, real>::to(1), gradWeight, scale, tgradOutputWindow, inputWindow);
+        THCTensor_(free)(state, tgradOutputWindow);
       }
     }
     THCTensor_(free)(state, gradOutputSample);

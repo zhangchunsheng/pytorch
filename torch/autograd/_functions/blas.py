@@ -168,7 +168,7 @@ class Addr(_BlasBase):
 
         if self.needs_input_grad[2]:
             # TODO: maybe it's better to do transpose + mv + transpose
-            grad_vector2 = torch.mm(vector1.unsqueeze(0), grad_output)
+            grad_vector2 = torch.mm(vector1.unsqueeze(0), grad_output).squeeze(0)
             if self.beta != 1:
                 grad_vector2 *= self.beta
 
@@ -192,10 +192,3 @@ class Dot(Function):
             grad_vector2 = vector1.mul(grad_output[0])
 
         return grad_vector1, grad_vector2
-
-
-# TODO: cross
-# TODO: diag
-# TODO: trace
-# TODO: tril
-# TODO: triu

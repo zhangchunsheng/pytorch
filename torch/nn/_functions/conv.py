@@ -29,6 +29,7 @@ class ConvNd(Function):
     def forward(self, input, weight, bias=None):
         k = input.dim()
         self.save_for_backward(input, weight, bias)
+        input = input.contiguous()
         if k == 3:
             input, weight = _view4d(input, weight)
         output = self._update_output(input, weight, bias)
@@ -38,7 +39,9 @@ class ConvNd(Function):
 
     def backward(self, grad_output):
         k = grad_output.dim()
+        grad_output = grad_output.contiguous()
         input, weight, bias = self.saved_tensors
+        input = input.contiguous()
         if k == 3:
             grad_output, input, weight = _view4d(grad_output, input, weight)
         grad_input = (self._grad_input(input, weight, grad_output)
@@ -68,25 +71,35 @@ class ConvNd(Function):
                     (in_size - 1) * stride - (2 * pad) + kernel + out_pad,)
             else:
                 output_size += ((in_size + (2 * pad) - kernel) // stride + 1,)
+        if not all(map(lambda s: s > 0, output_size)):
+            raise ValueError("convolution input is too small (output would be {})".format(
+                             'x'.join(map(str, output_size))))
         return output_size
 
     def _update_output(self, input, weight, bias):
-        self.use_cudnn = cudnn.is_acceptable(input) and not self.is_dilated()
+        self.use_cudnn = cudnn.is_acceptable(input)
+        if self.use_cudnn and cudnn.version() < 6000:
+            self.use_cudnn = not self.is_dilated()
         if self.use_cudnn:
             output = input.new(*self._output_size(input, weight))
             if self.transposed:
                 self._cudnn_info = (
                     torch._C._cudnn_convolution_transpose_full_forward(
-                        input, weight, bias, output, self.padding, self.stride,
+                        input, weight, bias, output, self.padding, self.stride, self.dilation,
                         self.groups, cudnn.benchmark))
             else:
                 self._cudnn_info = torch._C._cudnn_convolution_full_forward(
-                    input, weight, bias, output, self.padding, self.stride,
+                    input, weight, bias, output, self.padding, self.stride, self.dilation,
                     self.groups, cudnn.benchmark)
+            if not self.requires_grad:
+                del self._cudnn_info
             return output
 
         self._bufs = [[] for g in range(self.groups)]
-        return self._thnn('update_output', input, weight, bias)
+        output = self._thnn('update_output', input, weight, bias)
+        if not self.requires_grad:
+            del self._bufs
+        return output
 
     def _grad_input(self, input, weight, grad_output):
         if self.use_cudnn:

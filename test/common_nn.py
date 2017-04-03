@@ -2,11 +2,13 @@ import sys
 import tempfile
 import unittest
 from copy import deepcopy
+from itertools import product
 
 import torch
 import torch.cuda
 from torch.autograd import Variable
-from common import TestCase, to_gpu, get_numerical_jacobian, iter_tensors, contiguous
+from common import TestCase, to_gpu, freeze_rng_state
+from torch.autograd.gradcheck import get_numerical_jacobian, iter_tensors, contiguous
 import torch.backends.cudnn
 
 # tarfile module tries to obtain a file object name in python 3.3
@@ -162,13 +164,42 @@ module_tests = [
     ),
     dict(
         module_name='PReLU',
-        input_size=(2, 3, 4, 5)
+        input_size=(2, 3, 4),
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
+        desc='1d',
+    ),
+    dict(
+        module_name='PReLU',
+        constructor_args=(3,),
+        input_size=(2, 3, 4),
+        desc='1d_multiparam',
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
+    ),
+    dict(
+        module_name='PReLU',
+        input_size=(2, 3, 4, 5),
+        desc='2d',
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
     ),
     dict(
         module_name='PReLU',
         constructor_args=(3,),
         input_size=(2, 3, 4, 5),
-        desc='multiparam'
+        desc='2d_multiparam',
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
+    ),
+    dict(
+        module_name='PReLU',
+        input_size=(2, 3, 4, 5, 6),
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
+        desc='3d',
+    ),
+    dict(
+        module_name='PReLU',
+        constructor_args=(3,),
+        input_size=(2, 3, 4, 5, 6),
+        desc='3d_multiparam',
+        reference_fn=lambda i, p: torch.clamp(i, min=0) + torch.clamp(i, max=0) * p[0][0],
     ),
     dict(
         module_name='Softsign',
@@ -244,6 +275,13 @@ criterion_tests = [
         module_name='NLLLoss2d',
         input_size=(2, 3, 5, 5),
         target=torch.rand(2, 5, 5).mul(3).floor().long()
+    ),
+    dict(
+        module_name='NLLLoss2d',
+        constructor_args=(torch.rand(3),),
+        input_size=(2, 3, 5, 5),
+        target=torch.rand(2, 5, 5).mul(3).floor().long(),
+        desc='weights'
     ),
     dict(
         module_name='HingeEmbeddingLoss',
@@ -328,15 +366,19 @@ class NNTestCase(TestCase):
 
     def _flatten_tensors(self, x):
         if torch.is_tensor(x):
-            return x.view(-1)
+            if x.is_sparse:
+                return x.to_dense().view(-1)
+            else:
+                return x.view(-1)
         elif isinstance(x, Variable):
-            return x.data.view(-1)
+            return self._flatten_tensors(x.data)
         else:
             return tuple(self._flatten_tensors(a) for a in x)
 
     def _zero_grad_input(self, input):
         if isinstance(input, Variable):
-            input.grad.data.zero_()
+            if input.requires_grad and input.grad is not None:
+                input.grad.data.zero_()
         elif torch.is_tensor(input):
             return
         else:
@@ -400,9 +442,9 @@ class NNTestCase(TestCase):
         # TODO: enable non-contig tests
         input = contiguous(input)
         if jacobian_input:
-            res += get_numerical_jacobian(fw, input, input),
+            res += get_numerical_jacobian(fw, input, input, eps=1e-6),
         if jacobian_parameters:
-            res += torch.cat(list(get_numerical_jacobian(fw, input, p) for p in param), 0),
+            res += torch.cat(list(get_numerical_jacobian(fw, input, p, eps=1e-6) for p in param), 0),
         return res
 
     def check_jacobian(self, module, input, jacobian_input=True):
@@ -516,6 +558,8 @@ class ModuleTest(TestBase):
             expected_out = self.reference_fn(ref_input, test_case._get_parameters(module)[0])
             test_case.assertEqual(out, expected_out)
 
+        self.test_noncontig(test_case, module, input)
+
         # TODO: do this with in-memory files as soon as torch.save will support it
         with TemporaryFile() as f:
             test_case._forward(module, input)
@@ -525,6 +569,51 @@ class ModuleTest(TestBase):
             test_case.assertEqual(test_case._forward(module, input), test_case._forward(module_copy, input))
 
         self._do_test(test_case, module, input)
+
+    def noncontiguize(self, obj):
+        if isinstance(obj, list):
+            return [self.noncontiguize(o) for o in obj]
+        tensor = obj.data if isinstance(obj, Variable) else obj
+        ndim = tensor.dim()
+        noncontig = torch.stack([tensor.clone().zero_(), tensor], ndim).select(ndim, 1)
+        assert noncontig.numel() == 1 or not noncontig.is_contiguous()
+        if isinstance(obj, Variable):
+            return Variable(noncontig, requires_grad=obj.requires_grad)
+        return noncontig
+
+    def test_noncontig(self, test_case, module, input):
+        test_case._zero_grad_parameters(module)
+        test_case._zero_grad_input(input)
+        with freeze_rng_state():
+            output = test_case._forward(module, input)
+            grad_output = output
+            if isinstance(grad_output, Variable):
+                grad_output = grad_output.data.clone()
+            else:
+                grad_output = grad_output.clone()
+                output = output.clone()
+            grad_output.normal_()
+            d_input = deepcopy(test_case._backward(module, input, output, grad_output))
+            d_param = deepcopy(test_case._get_parameters(module)[1])
+
+        nc_input = self.noncontiguize(input)
+        nc_grad_output = self.noncontiguize(grad_output)
+        for contig_i, contig_g in product((True, False), repeat=2):
+            i = input if contig_i else nc_input
+            go = grad_output if contig_g else nc_grad_output
+            test_case._zero_grad_parameters(module)
+            test_case._zero_grad_input(i)
+            with freeze_rng_state():
+                try:
+                    out = test_case._forward(module, i)
+                except Exception:
+                    # Some modules will fail because of non contiguous inputs and we're ok with that
+                    continue
+                grad = test_case._backward(module, i, out, go)
+
+                test_case.assertEqual(out, output)
+                test_case.assertEqual(grad, d_input, 1e-4)
+                test_case.assertEqual(test_case._get_parameters(module)[1], d_param)
 
     def test_cuda(self, test_case):
         if not TEST_CUDA or not self.should_test_cuda:
@@ -536,8 +625,6 @@ class ModuleTest(TestBase):
 
             cpu_module = self.constructor(*self.constructor_args)
             gpu_module = self.constructor(*self.constructor_args).float().cuda()
-            test_case._zero_grad_parameters(cpu_module)
-            test_case._zero_grad_parameters(gpu_module)
             cpu_param = test_case._get_parameters(cpu_module)
             gpu_param = test_case._get_parameters(gpu_module)
             for cpu_p, gpu_p in zip(cpu_param[0], gpu_param[0]):
@@ -547,6 +634,10 @@ class ModuleTest(TestBase):
                     gpu_p = gpu_p.data
                 gpu_p.copy_(cpu_p)
 
+            test_case._zero_grad_input(cpu_input)
+            test_case._zero_grad_input(gpu_input)
+            test_case._zero_grad_parameters(cpu_module)
+            test_case._zero_grad_parameters(gpu_module)
             cpu_output = test_case._forward(cpu_module, cpu_input)
             gpu_output = test_case._forward(gpu_module, gpu_input)
             test_case.assertEqual(cpu_output, gpu_output, 2e-4)
@@ -560,6 +651,8 @@ class ModuleTest(TestBase):
                 test_case.assertEqual(cpu_gradInput, gpu_gradInput, 2e-4)
                 for cpu_d_p, gpu_d_p in zip(cpu_param[1], gpu_param[1]):
                     test_case.assertEqual(cpu_d_p, gpu_d_p, 2e-4)
+
+            self.test_noncontig(test_case, gpu_module, gpu_input)
         except NotImplementedError:
             pass
         # TODO: remove this after CUDA scatter_ is implemented

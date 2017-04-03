@@ -1,6 +1,7 @@
 import sys
 import torch._C as _C
 from collections import OrderedDict
+import torch.sparse as sparse
 import torch.utils.hooks as hooks
 
 from ._functions import *
@@ -56,30 +57,6 @@ class Variable(_C._VariableBase):
         'is_cuda',
     }
 
-    @property
-    def grad(self):
-        if self.requires_grad and self._grad is None:
-            # TODO: this won't have to be zeroed in the future
-            self._grad = Variable(self.data.new(self.data.size()).zero_())
-        return self._grad
-
-    @property
-    def requires_grad(self):
-        return self._requires_grad
-
-    @requires_grad.setter
-    def requires_grad(self, value):
-        if self.creator is not None:
-            if value is False:
-                hint = (" If you want to use a computed variable in a subgraph "
-                        "that doesn't require differentiation use "
-                        "var_no_grad = var.detach().")
-            else:
-                hint = ''
-            raise RuntimeError("you can only change requires_grad flags of "
-                               "leaf variables." + hint)
-        self._requires_grad = value
-
     def __getattr__(self, name):
         if name in self._fallthrough_methods:
             return getattr(self.data, name)
@@ -108,19 +85,30 @@ class Variable(_C._VariableBase):
         if self.creator is not None:
             raise RuntimeError("Only Variables created explicitly by the user "
                                "(graph leaves) support the deepcopy protocol at the moment")
-        result = type(self)(self.data.clone(), requires_grad=self.requires_grad,
-                            volatile=self.volatile)
+        result = type(self)(self.data.clone())
+        result.requires_grad = self.requires_grad
+        result.volatile = self.volatile
         memo[id(self)] = result
         return result
 
     def __reduce_ex__(self, proto):
+        state = (self.requires_grad, self.volatile, self._backward_hooks)
         if proto > 1:
-            return super(Variable, self).__reduce_ex__(proto)
+            return type(self), (self.data,), state
         if sys.version_info[0] == 2:
             from copy_reg import __newobj__
         else:
             from copyreg import __newobj__
-        return __newobj__, (type(self),), self.__getstate__()
+        return __newobj__, (type(self), self.data), state
+
+    def __setstate__(self, state):
+        if len(state) == 5:
+            # legacy serialization of Variable
+            self.data = state[0]
+            state = (state[3], state[4], state[2])
+        if self.creator is not None:
+            raise RuntimeError('__setstate__ can be only called on leaf variables')
+        self.requires_grad, self.volatile, self._backward_hooks = state
 
     def __repr__(self):
         return 'Variable containing:' + self.data.__repr__()
@@ -131,7 +119,7 @@ class Variable(_C._VariableBase):
         The graph is differentiated using the chain rule. If the variable is
         non-scalar (i.e. its data has more than one element) and requires
         gradient, the function additionaly requires specifying ``gradient``.
-        It should be a tensor of matching type and location, that containins
+        It should be a tensor of matching type and location, that contains
         the gradient of the differentiated function w.r.t. ``self``.
 
         This function accumulates gradients in the leaves - you might need to zero
@@ -163,7 +151,7 @@ class Variable(_C._VariableBase):
         The hook will be called every time a gradient with respect to the
         variable is computed. The hook should have the following signature::
 
-            hook(grad) -> Tensor or None
+            hook(grad) -> Variable or None
 
         The hook should not modify its argument, but it can optionally return
         a new gradient which will be used in place of :attr:`grad`.
@@ -192,21 +180,8 @@ class Variable(_C._VariableBase):
             if self.creator is not None:
                 self.creator._register_hook_dict(self)
         handle = hooks.RemovableHandle(self._backward_hooks)
-        self._backward_hooks[id(handle)] = hook
+        self._backward_hooks[handle.id] = hook
         return handle
-
-    def _do_backward(self, grad_output, retain_variables):
-        assert len(grad_output) == 1
-        assert self._version == 0 and self.creator is None, \
-            "leaf variable was used in an inplace operation"
-        unpacked_grad = grad_output[0]
-        if self._backward_hooks:
-            for hook in self._backward_hooks.values():
-                result = hook(unpacked_grad)
-                if result is not None:
-                    unpacked_grad = result
-        self.grad.data.add_(unpacked_grad)
-        return tuple()
 
     def reinforce(self, reward):
         """Registers a reward obtained as a result of a stochastic process.
@@ -225,8 +200,25 @@ class Variable(_C._VariableBase):
         self.creator._reinforce(reward)
 
     def detach(self):
-        """Detaches the Variable from the graph that created it."""
-        return NoGrad()(self)
+        """Returns a new Variable, detached from the current graph.
+
+        Result will never require gradient. If the input is volatile, the output
+        will be volatile too.
+
+        .. note::
+
+          Returned Variable uses the same data tensor, as the original one, and
+          in-place modifications on either of them will be seen, and may trigger
+          errors in correctness checks.
+        """
+        result = NoGrad()(self)  # this is needed, because it merges version counters
+        result._creator = None
+        return result
+
+    def detach_(self):
+        """Detaches the Variable from the graph that created it, making it a leaf."""
+        self._creator = None
+        self.requires_grad = False
 
     def contiguous(self):
         self.data = self.data.contiguous()
@@ -426,12 +418,6 @@ class Variable(_C._VariableBase):
     def trunc(self):
         return Trunc()(self)
 
-    def floor(self):
-        return Floor()(self)
-
-    def ceil(self):
-        return Ceil()(self)
-
     def fmod(self, value):
         return Fmod(value)(self)
 
@@ -483,6 +469,40 @@ class Variable(_C._VariableBase):
 
     def view_as(self, tensor):
         return View(*tensor.size())(self)
+
+    def split(self, split_size, dim=0):
+        return torch.split(self, split_size, dim)
+
+    def repeat(self, *repeats):
+        if len(repeats) == 1 and isinstance(repeats[0], torch.Size):
+            repeats = repeats[0]
+        else:
+            repeats = torch.Size(repeats)
+        return Repeat(repeats)(self)
+
+    def cumsum(self, dim):
+        return Cumsum(dim)(self)
+
+    def var(self, dim=None, unbiased=True):
+        mean = self.mean(dim)
+        if dim is None:
+            mean = mean.view(*(1 for s in self.size()))
+        mean_expanded = mean.expand_as(self)
+        zero_centered = self.sub(mean_expanded)
+        var = zero_centered.mul(zero_centered).sum(dim)
+        numel = self.numel() if dim is None else self.size(dim)
+        return var.div(numel - int(unbiased))
+
+    def std(self, dim=None, unbiased=True):
+        return self.var(dim, unbiased).sqrt()
+
+    def renorm(self, norm_type, dim, maxnorm):
+        t = self.transpose(dim, 0)
+        flat = t.contiguous().view(self.size(0), -1)
+        norms = flat.norm(norm_type, 1)
+        norms = norms.clamp(max=maxnorm).div(norms.add(1e-7))
+        flat_out = flat.mul(norms.expand_as(flat))
+        return flat_out.view(t.size()).transpose(dim, 0)
 
     @staticmethod
     def _static_blas(cls, args, inplace):
@@ -668,11 +688,53 @@ class Variable(_C._VariableBase):
     def triu(self, diagonal_idx=0):
         return Triu(diagonal_idx)(self)
 
+    def trace(self):
+        return Trace()(self)
+
+    def cross(self, other, dim=-1):
+        return Cross(dim)(self, other)
+
     def multinomial(self, num_samples=1, with_replacement=False):
         return Multinomial(num_samples, with_replacement)(self)
 
     def bernoulli(self):
         return Bernoulli()(self)
+
+    def eq(self, other):
+        if isinstance(other, Variable):
+            return Eq()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Eq(other)(self)
+
+    def ne(self, other):
+        if isinstance(other, Variable):
+            return Ne()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Ne(other)(self)
+
+    def gt(self, other):
+        if isinstance(other, Variable):
+            return Gt()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Gt(other)(self)
+
+    def ge(self, other):
+        if isinstance(other, Variable):
+            return Ge()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Ge(other)(self)
+
+    def lt(self, other):
+        if isinstance(other, Variable):
+            return Lt()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Lt(other)(self)
+
+    def le(self, other):
+        if isinstance(other, Variable):
+            return Le()(self, other)
+        assert not torch.is_tensor(other), "can't compare Variable and tensor"
+        return Le(other)(self)
 
     def __add__(self, other):
         return self.add(other)
@@ -743,23 +805,26 @@ class Variable(_C._VariableBase):
     def __iter__(self):
         return iter(map(lambda i: self[i], range(self.size(0))))
 
+    def __mod__(self, other):
+        return self.remainder(other)
+
     def __eq__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.eq(other)
 
     def __ne__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.ne(other)
 
     def __lt__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.lt(other)
 
     def __le__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.le(other)
 
     def __gt__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.gt(other)
 
     def __ge__(self, other):
-        raise TypeError("Variables are not comparable yet.")
+        return self.ge(other)
 
     def __hash__(self):
         return id(self)
@@ -771,11 +836,11 @@ class Variable(_C._VariableBase):
             return Concat(dim)(*iterable)
 
         @staticmethod
-        def normal(means, stddev=1):
-            if isinstance(stddev, Variable):
-                return Normal()(means, stddev)
+        def normal(means, std=1):
+            if isinstance(std, Variable):
+                return Normal()(means, std)
             else:
-                return Normal(stddev)(means)
+                return Normal(std)(means)
 
         @staticmethod
         def _blas(cls, args, inplace):

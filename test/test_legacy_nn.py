@@ -483,14 +483,14 @@ tests = [
                   input_size=(1, 2, 4, 4, 4)),
     OldModuleTest(nn.VolumetricMaxPooling,
                   (2, 2, 2),
-                  input_size=(2, 3, 5, 5, 5)),
+                  input=(torch.randn(2, 3, 5, 5, 5) * 1000)),
     OldModuleTest(nn.VolumetricMaxPooling,
                   (2, 2, 2, 2, 2, 2),
-                  input_size=(2, 3, 5, 5, 5),
+                  input=(torch.randn(2, 3, 5, 5, 5) * 1000),
                   desc='stride'),
     OldModuleTest(nn.VolumetricMaxPooling,
                   (2, 2, 2, 2, 2, 2, 1, 1, 1),
-                  input_size=(2, 3, 5, 5, 5),
+                  input=(torch.randn(2, 3, 5, 5, 5) * 1000),
                   desc='stride_padding'),
     OldModuleTest(nn.VolumetricReplicationPadding,
                   (1, 2, 3, 4, 5, 6),
@@ -1154,6 +1154,15 @@ class TestNN(NNTestCase):
         module.__repr__()
         str(module)
 
+    def test_accUpdateGradParameters(self):
+        module = nn.LookupTable(5, 3)
+        module.weight.fill_(2)
+        input = torch.LongTensor([1, 3])
+        output = module.updateOutput(input)
+        module.backwardUpdate(input, output, 0.1)
+        self.assertEqual(module.weight[0, 0], 2)
+        self.assertEqual(module.weight[3, 0], 1.8)
+
     def _build_net(self):
         return (nn.Sequential()
                 .add(nn.Concat(0)
@@ -1242,6 +1251,8 @@ class TestNN(NNTestCase):
                 self.assertIsInstance(module, type(reference))
 
 
+prepare_tests()
+
+
 if __name__ == '__main__':
-    prepare_tests()
     run_tests()

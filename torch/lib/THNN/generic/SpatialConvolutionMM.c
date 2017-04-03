@@ -4,7 +4,7 @@
 
 static inline void THNN_(SpatialConvolutionMM_shapeCheck)(
 	THTensor *input, THTensor *gradOutput,
-	THTensor *weight, THTensor *bias, 
+	THTensor *weight, THTensor *bias,
 	int kH, int kW, int dH, int dW, int padH, int padW) {
 
   THArgCheck(kW > 0 && kH > 0, 9,
@@ -45,7 +45,7 @@ static inline void THNN_(SpatialConvolutionMM_shapeCheck)(
 	    nInputPlane,inputHeight,inputWidth,nOutputPlane,outputHeight,outputWidth);
 
   THNN_CHECK_DIM_SIZE(input, ndim, dimf, nInputPlane);
-  
+
   if (gradOutput != NULL) {
     THNN_CHECK_DIM_SIZE(gradOutput, ndim, dimf, nOutputPlane);
     THNN_CHECK_DIM_SIZE(gradOutput, ndim, dimh, outputHeight);
@@ -251,13 +251,13 @@ void THNN_(SpatialConvolutionMM_updateGradInput)(
   // be left uninitialized on zero alpha, which might lead to weird behavior
   // hence, to be safe, zero it
   THTensor_(zero)(fgradInput);
-
-  THTensor_(transpose)(weight, weight, 0, 1);
+  THTensor *tweight = THTensor_(new)();
+  THTensor_(transpose)(tweight, weight, 0, 1);
 
   if(input->nDimension == 3)
   {
     THNN_(SpatialConvolutionMM_updateGradInput_frame)(gradInput, gradOutput,
-						      weight, fgradInput,
+						      tweight, fgradInput,
 						      kW, kH, dW, dH, padW, padH);
   }
   else
@@ -273,7 +273,7 @@ void THNN_(SpatialConvolutionMM_updateGradInput)(
       THTensor *fgradInput_t = THTensor_(newSelect)(fgradInput, 0, t);
 
       THNN_(SpatialConvolutionMM_updateGradInput_frame)(gradInput_t, gradOutput_t,
-							weight, fgradInput_t,
+							tweight, fgradInput_t,
 							kW, kH, dW, dH, padW, padH);
 
       THTensor_(free)(gradInput_t);
@@ -282,8 +282,7 @@ void THNN_(SpatialConvolutionMM_updateGradInput)(
     }
   }
 
-  THTensor_(transpose)(weight, weight, 0, 1);
-
+  THTensor_(free)(tweight);
   THTensor_(free)(input);
   THTensor_(free)(gradOutput);
   if (freeWeight)
@@ -303,9 +302,10 @@ static void THNN_(SpatialConvolutionMM_accGradParameters_frame)(
      gradOutput->size[0], -1,
      gradOutput->size[1]*gradOutput->size[2], -1);
 
-  THTensor_(transpose)(finput, finput, 0, 1);
-  THTensor_(addmm)(gradWeight, 1, gradWeight, scale, gradOutput2d, finput);
-  THTensor_(transpose)(finput, finput, 0, 1);
+  THTensor *tfinput = THTensor_(new)();
+  THTensor_(transpose)(tfinput, finput, 0, 1);
+  THTensor_(addmm)(gradWeight, 1, gradWeight, scale, gradOutput2d, tfinput);
+  THTensor_(free)(tfinput);
 
   if (gradBias) {
     for(i = 0; i < gradBias->size[0]; i++)
@@ -336,8 +336,9 @@ void THNN_(SpatialConvolutionMM_accGradParameters)(
           int dH,
           int padW,
           int padH,
-          real scale)
+          accreal scale_)
 {
+  real scale = TH_CONVERT_ACCREAL_TO_REAL(scale_);
   int freeWeight = 0;
 
   if (gradWeight->nDimension == 4) {

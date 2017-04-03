@@ -221,7 +221,7 @@ See :func:`torch.bmm`
 
 add_docstr(torch._C.FloatTensorBase.cauchy_,
            """
-cauchy_(generator=None, median=0, sigma=1) -> Tensor
+cauchy_(median=0, sigma=1, *, generator=None) -> Tensor
 
 Fills the tensor with numbers drawn from the Cauchy distribution:
 
@@ -445,7 +445,7 @@ In-place version of :meth:`~Tensor.exp`
 
 add_docstr(torch._C.FloatTensorBase.exponential_,
            """
-exponential_(generator=None, lambd=1) -> Tensor
+exponential_(lambd=1, *, generator=None) -> Tensor
 
 Fills this tensor with elements drawn from the exponential distribution:
 
@@ -533,7 +533,7 @@ See :func:`torch.gels`
 
 add_docstr(torch._C.FloatTensorBase.geometric_,
            """
-geometric_(generator=None, p) -> Tensor
+geometric_(p, *, generator=None) -> Tensor
 
 Fills this tensor with elements drawn from the geometric distribution:
 
@@ -648,7 +648,7 @@ Example:
 
 add_docstr(torch._C.FloatTensorBase.index_fill_,
            """
-index_fill_(dim, index, tensor) -> Tensor
+index_fill_(dim, index, val) -> Tensor
 
 Fills the elements of the original tensor with value :attr:`val` by selecting
 the indices in the order given in index.
@@ -761,7 +761,7 @@ In-place version of :meth:`~Tensor.log`
 """)
 
 add_docstr(torch._C.FloatTensorBase.log_normal_, u"""
-log_normal_(generator=None, mean=1, stdv=2)
+log_normal_(mean=1, std=2, *, generator=None)
 
 Fills this tensor with numbers samples from the log-normal distribution
 parameterized by the given mean (\u00B5) and standard deviation (\u03C3). Note that
@@ -895,7 +895,7 @@ In-place version of :meth:`~Tensor.mul`
 
 add_docstr(torch._C.FloatTensorBase.multinomial,
            """
-multinomial(generator=None, num_samples, replacement=False)
+multinomial(num_samples, replacement=False, *, generator=None)
 
 See :func:`torch.multinomial`
 """)
@@ -991,10 +991,10 @@ See :func:`torch.norm`
 
 add_docstr(torch._C.FloatTensorBase.normal_,
            """
-normal_(generator=None, mean=0, var=1)
+normal_(mean=0, std=1, *, generator=None)
 
 Fills this tensor with elements samples from the normal distribution
-parameterized by :attr:`mean` and :attr:`var`.
+parameterized by :attr:`mean` and :attr:`std`.
 """)
 
 add_docstr(torch._C.FloatTensorBase.numel,
@@ -1085,11 +1085,11 @@ See :func:`torch.qr`
 
 add_docstr(torch._C.FloatTensorBase.random_,
            """
-random_(generator=None, from=0, to=None)
+random_(from=0, to=None, *, generator=None)
 
 Fills this tensor with numbers sampled from the uniform distribution or
-discrete uniform distribution over [from, to]. If not specified, :attr:`to`
-defaults to the largest value representable by this tensor's data type.
+discrete uniform distribution over [from, to - 1]. If not specified, the
+values are only bounded by this tensor's data type.
 """)
 
 add_docstr(torch._C.FloatTensorBase.reciprocal,
@@ -1272,13 +1272,6 @@ Args:
     storage_offset (int): The offset in the storage
     size (torch.Size): The desired size. Defaults to the size of the source.
     stride (tuple): The desired stride. Defaults to C-contiguous strides.
-""")
-
-add_docstr(torch._C.FloatTensorBase.set_index,
-           """
-set_index(index, value)
-
-Alias for ``self[index] = value``
 """)
 
 add_docstr(torch._C.FloatTensorBase.sigmoid,
@@ -1639,11 +1632,50 @@ Fills this tensor with numbers sampled from the uniform distribution:
     P(x) = \dfrac{1}{to - from}
 """)
 
+add_docstr(torch._C.FloatTensorBase.unsqueeze,
+           """
+unsqueeze(dim)
+
+See :func:`torch.unsqueeze`
+""")
+
+add_docstr(torch._C.FloatTensorBase.unsqueeze_,
+           """
+unsqueeze_(dim)
+
+In-place version of :meth:`~Tensor.unsqueeze`
+""")
+
 add_docstr(torch._C.FloatTensorBase.var,
            """
 var() -> float
 
 See :func:`torch.var`
+""")
+
+add_docstr(torch._C.FloatTensorBase.view,
+           """
+view(*args) -> Tensor
+
+Returns a new tensor with the same data but different size.
+
+The returned tensor shares the same data and must have the same number
+of elements, but may have a different size. A tensor must be
+:func:`contiguous` to be viewed.
+
+Args:
+    args (torch.Size or int...): Desired size
+
+Example:
+    >>> x = torch.randn(4, 4)
+    >>> x.size()
+    torch.Size([4, 4])
+    >>> y = x.view(16)
+    >>> y.size()
+    torch.Size([16])
+    >>> z = x.view(-1, 8)  # the size -1 is inferred from other dimensions
+    >>> z.size()
+    torch.Size([2, 8])
 """)
 
 add_docstr(torch._C.FloatTensorBase.zero_,
